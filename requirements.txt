@@ -1,0 +1,7 @@
+fastapi>=0.104.0
+uvicorn[standard]>=0.24.0
+python-dotenv>=1.0.0
+openai-agents>=0.0.7
+pandas>=2.0.0
+google-play-scraper>=1.2.4
+python-multipart>=0.0.6
