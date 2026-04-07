@@ -2,6 +2,8 @@ import os
 import json
 import time
 import uuid
+import asyncio
+import traceback
 from collections import defaultdict
 from typing import Optional
 
@@ -9,12 +11,12 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from fastapi import FastAPI, UploadFile, File, Form, Request, HTTPException
-from fastapi.responses import StreamingResponse, FileResponse
+from fastapi.responses import StreamingResponse, FileResponse, JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.csv_parser import parse_csv
 from app.review_fetcher import search_google_play_apps, fetch_reviews_for_app
-from app.pipeline import run_analysis
+from app.pipeline import run_analysis, results_cache
 
 app = FastAPI(title="Customer Feedback Analyzer")
 
@@ -30,8 +32,8 @@ app.add_middleware(
 rate_limit_store: dict = defaultdict(list)
 DAILY_LIMIT = 5
 
-
 LOCALHOST_IPS = {"127.0.0.1", "::1", "localhost"}
+
 
 
 def check_rate_limit(ip: str) -> bool:
@@ -53,16 +55,31 @@ def get_client_ip(request: Request) -> str:
     return request.client.host if request.client else "unknown"
 
 
+SSE_HEADERS = {
+    "Cache-Control": "no-cache, no-store, must-revalidate",
+    "X-Accel-Buffering": "no",
+    "Connection": "keep-alive",
+    "Content-Type": "text/event-stream",
+}
+
+
 async def sse_generator(feedback_items, data_source, source_labels=None):
-    async for event in run_analysis(feedback_items, data_source, source_labels):
-        event_type = event.get("event", "status")
-        data = event.get("data", "")
-        yield f"event: {event_type}\ndata: {data}\n\n"
+    session_id = uuid.uuid4().hex
+    try:
+        async for event in run_analysis(feedback_items, data_source, source_labels, session_id=session_id):
+            event_type = event.get("event", "status")
+            data = event.get("data", "")
+            yield f"event: {event_type}\ndata: {data}\n\n"
+    except Exception as e:
+        error_msg = f"{type(e).__name__}: {str(e)}"
+        print(f"[SSE ERROR] {error_msg}\n{traceback.format_exc()}")
+        yield f"event: error\ndata: {error_msg}\n\n"
 
 
 @app.get("/health")
 async def health():
     return {"status": "ok"}
+
 
 
 @app.post("/analyze")
@@ -81,11 +98,10 @@ async def analyze(request: Request):
 
     lines = [line.strip() for line in feedback_text.strip().split("\n") if line.strip()]
     feedback_items = [{"text": line} for line in lines]
-
     return StreamingResponse(
         sse_generator(feedback_items, "Pasted text"),
         media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        headers=SSE_HEADERS,
     )
 
 
@@ -113,7 +129,7 @@ async def analyze_csv(request: Request, file: UploadFile = File(...)):
     return StreamingResponse(
         sse_generator(feedback_items, "CSV upload"),
         media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        headers=SSE_HEADERS,
     )
 
 
@@ -199,7 +215,7 @@ async def analyze_reviews(request: Request):
     return StreamingResponse(
         sse_generator(feedback_items, f"Google Play: {app_name}"),
         media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        headers=SSE_HEADERS,
     )
 
 
@@ -241,11 +257,10 @@ async def analyze_combined(request: Request):
         raise HTTPException(status_code=400, detail="No feedback provided.")
 
     data_source = f"Combined: Google Play ({app_name}) + User Provided"
-
     return StreamingResponse(
         sse_generator(feedback_items, data_source, source_labels),
         media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        headers=SSE_HEADERS,
     )
 
 
@@ -294,12 +309,18 @@ async def analyze_combined_csv(
         source_labels[idx] = "User Provided"
 
     data_source = f"Combined: Google Play ({app_name}) + CSV Upload"
-
     return StreamingResponse(
         sse_generator(feedback_items, data_source, source_labels),
         media_type="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+        headers=SSE_HEADERS,
     )
+
+
+@app.get("/result/{session_id}")
+async def get_result(session_id: str):
+    if session_id not in results_cache:
+        raise HTTPException(status_code=404, detail="Result not found or not ready yet.")
+    return JSONResponse(content=results_cache.pop(session_id))
 
 
 @app.get("/")

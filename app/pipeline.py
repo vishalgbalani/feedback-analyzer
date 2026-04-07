@@ -1,9 +1,13 @@
 import json
+import uuid
 import asyncio
 from typing import List, Dict, Optional, AsyncGenerator
 from agents import Agent, Runner
 
 from app.models import CategorizedChunk, FeedbackAnalysis
+
+# Module-level cache for completed analysis results (Railway SSE fallback)
+results_cache: Dict[str, dict] = {}
 
 CATEGORIZER_INSTRUCTIONS = """Categorize each review. Return JSON: {"items":[{"i":0,"t":"Theme","s":"Positive"},...]}.
 i = review index (0-based), t = theme name, s = Positive/Negative/Neutral.
@@ -123,6 +127,7 @@ async def run_analysis(
     feedback_items: List[Dict],
     data_source: str = "Pasted text",
     source_labels: Optional[Dict[int, str]] = None,
+    session_id: Optional[str] = None,
 ) -> AsyncGenerator[Dict, None]:
     """Run the two-agent pipeline with SSE events."""
 
@@ -302,7 +307,16 @@ Generate FeedbackAnalysis JSON."""
         return
 
     yield {"event": "progress", "data": json.dumps({"stage": "done", "pct": 100})}
-    yield {"event": "analysis", "data": json.dumps(analysis_dict, default=str)}
+
+    # Cache the result before yielding so the fallback endpoint can serve it
+    report_json = json.dumps(analysis_dict, default=str)
+    if session_id:
+        results_cache[session_id] = analysis_dict
+
+    yield {"event": "analysis", "data": report_json}
+    if session_id:
+        yield {"event": "result_ready", "data": json.dumps({"session_id": session_id})}
+    await asyncio.sleep(0.1)
     yield {"event": "done", "data": "Analysis complete."}
 
 

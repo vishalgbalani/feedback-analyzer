@@ -706,6 +706,8 @@ function resetResults() {
   document.getElementById('stage1-content').innerHTML = '';
   document.getElementById('stage2-content').innerHTML = '';
   clearProgress();
+  window._reportRendered = false;
+  window._fallbackSessionId = null;
 }
 
 function escapeHtml(text) {
@@ -756,9 +758,12 @@ async function streamSSE(response, showCombinePanel = false) {
 }
 
 function handleSSEEvent(type, data, showCombinePanel) {
+  console.log('[SSE]', type, type === 'analysis' || type === 'analysis_themes' || type === 'analysis_rest'
+    ? '(' + data.length + ' bytes) ' + data.slice(0, 150) + '...'
+    : (data.length > 100 ? data.slice(0, 100) + '...' : data));
+
   if (type === 'status') {
     showProgressArea();
-    // Map old status messages to progress stages
     const msg = data.toLowerCase();
     if (msg.includes('parsing')) updateProgress(5, 'parsing');
     else if (msg.includes('analyzing') || msg.includes('chunk')) updateProgress(15, 'categorizing');
@@ -786,6 +791,26 @@ function handleSSEEvent(type, data, showCombinePanel) {
   } else if (type === 'analysis') {
     updateProgress(100, 'done');
     renderStage2(JSON.parse(data));
+    window._reportRendered = true;
+    console.log('[SSE] Report rendered');
+  } else if (type === 'result_ready') {
+    // Fallback: if SSE report event was dropped (e.g. Railway proxy), fetch via REST after 5s
+    const info = JSON.parse(data);
+    window._fallbackSessionId = info.session_id;
+    setTimeout(() => {
+      if (window._reportRendered) return;
+      console.log('[SSE] Report event missed, fetching via fallback /result/' + info.session_id);
+      fetch('/result/' + info.session_id)
+        .then(r => r.ok ? r.json() : null)
+        .then(json => {
+          if (json && !window._reportRendered) {
+            renderStage2(json);
+            window._reportRendered = true;
+            console.log('[SSE] Report rendered via fallback');
+          }
+        })
+        .catch(err => console.warn('[SSE] Fallback fetch failed:', err));
+    }, 5000);
   } else if (type === 'done') {
     updateProgress(100, 'done');
   }
